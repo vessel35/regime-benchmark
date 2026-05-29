@@ -945,6 +945,53 @@ joined_output_1m:
   segment_id_5m: string
 ```
 
+### 13.4 PostgreSQL 영속화 대상
+
+13.1·13.2·13.3의 출력은 추후 예측 모델 학습·비교에 재사용할 수 있도록 PostgreSQL에 영속화한다.
+저장은 **별도의 쓰기 가능한 전용 DB** (`regime_benchmark`, 예: 로컬 Docker `postgis/postgis:16-3.4`)에서 수행하며,
+하네스의 읽기 전용 MCP DB (`crypto_data`, `signal`, `wallet_db`)에는 쓰지 않는다.
+
+DSN은 환경변수 `${REGIME_BENCHMARK_DB_URL}`로 주입하고, 스키마는 `migrations/001_init.sql`을 통해 생성한다.
+본 DSN은 **`regime_owner` 사용자**로 접속하며, `regime_owner` role과 `regime_benchmark` DB는
+`migrations/000_init_roles.sql` + `scripts/bootstrap_db.sh`로 일회 부트스트랩한다 (자세한 절차는
+`docs/design.md` §13.8 참조).
+
+| 항목 | 요구사항 |
+|---|---|
+| 엔진 | PostgreSQL 16+ (네이티브 declarative 파티셔닝) |
+| 라벨 수치 타입 | `DOUBLE PRECISION` (float64; hlc3는 체결가 아님) |
+| 라벨 축 타입 | PostgreSQL ENUM (`direction_label`, `volatility_label`, `final_label`, `timeframe_enum`) |
+| 스키마 구조 | 통합 테이블 `segment_labels`, `bar_labels` + `timeframe` 컬럼. timeframe별 분리 테이블은 사용하지 않는다 |
+| `bar_labels` 파티셔닝 | `open_time` 기준 월 단위 RANGE 파티션 (2024-01 ~ 2026-06, 30개월) |
+| 재현성 단위 | `labeling_runs(id, method_version, period, run_status, completed_at, ...)` + timeframe별 `labeling_run_params`. 1m·5m가 **동일 run_id**에 속해야 join 일관성이 보장된다 (§9.1 timeframe 독립 계산은 유지 — run은 운영 단위 grouping이며 분위수·threshold는 timeframe별 독립) |
+| 버전 관리 | append-only. 동일 (`method_version`, period) 재실행 시 새 `run_id` 생성, 과거 라벨 보존 |
+| Run 상태 | `run_status ∈ {loading, completed, failed}` + `completed_at`. 소비자는 `WHERE run_status='completed'` 로 부분/실패 run 배제 |
+| 적재 방식 | `psycopg3 COPY ... FROM STDIN` (1m bar 약 126만 행, 대량 적재 최적화) |
+| 13.1/13.2/13.3 매핑 | `segment_labels` / `bar_labels` (월 파티션) / VIEW `joined_labels_1m_5m` |
+| `_1m` / `_5m` 노출 | VIEW `bar_labels_1m`, `bar_labels_5m`, `segment_labels_1m`, `segment_labels_5m` (timeframe 컬럼 필터) |
+| 검증/진단 리포트 | `labeling_reports(run_id, report_type, passed, payload JSONB)` |
+
+5분 버킷 매핑 (`joined_labels_1m_5m` view, **LEFT JOIN — additive 매핑**, 5m 부분 적재 시 `label_5m`이 NULL로 노출):
+
+```sql
+SELECT ... FROM bar_labels b1
+LEFT JOIN bar_labels b5
+  ON b1.run_id = b5.run_id AND b5.timeframe='5m'
+ AND extract(epoch FROM b5.open_time) = floor(extract(epoch FROM b1.open_time)/300)*300
+WHERE b1.timeframe='1m';
+```
+
+PASS/FAIL 정합성 (DB 레벨 구조적 강제):
+- bar 당 단일 9라벨 (`pk_bar_labels = (run_id, timeframe, open_time)`).
+- segment 비겹침·교대성은 적재 전 검증(`validation/`)에서 확인하고 위반 시 적재하지 않는다.
+- **`ck_*_final_label_consistency`**: `final_label = direction_label || '_' || volatility_label` 을 segment·bar 양 테이블에서 CHECK로 강제 → §19-10 "진단값이 최종 9라벨을 변경" 실패 모드를 **구조적으로 차단**.
+- `ck_segment_labels_ranges`: §11.4 범위 검증 (`0≤ER≤1`, `0≤capturable_ratio≤1`, `0≤max_jump_share≤1`, `0≤downside_vol_share≤1`, RV·jump·rv±·amplitude_to_cost_ratio 등 비음수, `segment_bar_count≥1`, `end≥start`).
+- `ck_segment_labels_confirm`: 꼬리 미확정(`is_tail_unconfirmed=true`)을 제외하면 (`confirm_timestamp`, `lag_bars`, `lag_move`, `capturable_amplitude`, `capturable_ratio`) 전부 NOT NULL.
+- `ck_bar_labels_ohlc`로 §4.3 OHLC 관계를 DB 레벨에서 강제한다.
+- `symbol`, `market`, `method_version`은 §13.1·§13.2 출력 스키마 명시 필드이므로 두 테이블에 **denormalize NOT NULL** 컬럼으로 보유한다.
+
+> 자세한 DDL은 [`/migrations/001_init.sql`](../migrations/001_init.sql), 모듈 설계는 [`/docs/design.md`](./design.md) §13 참조.
+
 ---
 
 ## 14. 권장 설정 초기값
@@ -1028,6 +1075,35 @@ labeling_config:
     - "NON_DIRECTIONAL_LOW_VOL"
     - "NON_DIRECTIONAL_MID_VOL"
     - "NON_DIRECTIONAL_HIGH_VOL"
+
+  persistence:
+    engine: "postgresql"
+    version: ">=16"
+    database: "regime_benchmark"
+    dsn_env: "REGIME_BENCHMARK_DB_URL"
+    migration_file: "migrations/001_init.sql"
+    write_target: "dedicated_writable_db_only"
+    read_only_mcp_dbs_excluded: true        # crypto_data / signal / wallet_db 미사용
+    bulk_load: "psycopg3_copy_from_stdin"
+    versioning: "append_only_per_run_id"
+    bar_labels:
+      partition_strategy: "range_monthly"
+      partition_column: "open_time"
+      partition_range:
+        start: "2024-01"
+        end:   "2026-06"
+    enums:
+      timeframe:   ["1m", "5m"]
+      direction:   ["UP", "DOWN", "NON_DIRECTIONAL"]
+      volatility:  ["LOW_VOL", "MID_VOL", "HIGH_VOL"]
+      final_label_count: 9
+    numeric_type: "double_precision"        # float64; hlc3는 체결가 아님 (§5.1)
+    views:
+      - "bar_labels_1m"
+      - "bar_labels_5m"
+      - "segment_labels_1m"
+      - "segment_labels_5m"
+      - "joined_labels_1m_5m"
 ```
 
 ---
@@ -1090,15 +1166,16 @@ labeling_config:
 
 ## 17. 핵심 산출물
 
-| 산출물 | 설명 |
-|---|---|
-| `segment_labels_1m` | 1분봉 segment-level 라벨 |
-| `bar_labels_1m` | 1분봉 bar-level 라벨 |
-| `segment_labels_5m` | 5분봉 segment-level 라벨 |
-| `bar_labels_5m` | 5분봉 bar-level 라벨 |
-| `joined_labels_1m_5m` | 1분 단위 기준으로 1분봉·5분봉 라벨을 함께 제공 |
-| `labeling_validation_report` | 공식 검증, 데이터 검증, PASS/FAIL 결과 |
-| `diagnostic_report` | lag, tradeability, jump, downside volatility, ER-RV correlation 진단 결과 |
+| 산출물 | 설명 | PostgreSQL 물리 대상 (§13.4) |
+|---|---|---|
+| `segment_labels_1m` | 1분봉 segment-level 라벨 | VIEW `segment_labels_1m` (← `segment_labels` where `timeframe='1m'`) |
+| `bar_labels_1m` | 1분봉 bar-level 라벨 | VIEW `bar_labels_1m` (← 월 파티션 테이블 `bar_labels` where `timeframe='1m'`) |
+| `segment_labels_5m` | 5분봉 segment-level 라벨 | VIEW `segment_labels_5m` (← `segment_labels` where `timeframe='5m'`) |
+| `bar_labels_5m` | 5분봉 bar-level 라벨 | VIEW `bar_labels_5m` (← `bar_labels` where `timeframe='5m'`) |
+| `joined_labels_1m_5m` | 1분 단위 기준으로 1분봉·5분봉 라벨을 함께 제공 | VIEW `joined_labels_1m_5m` (동일 `run_id` 내 5분 floor 버킷 조인) |
+| `labeling_validation_report` | 공식 검증, 데이터 검증, PASS/FAIL 결과 | `labeling_reports` (`report_type='validation'`, `passed BOOLEAN`, `payload JSONB`) |
+| `diagnostic_report` | lag, tradeability, jump, downside volatility, ER-RV correlation 진단 결과 | `labeling_reports` (`report_type='diagnostic'`, `payload JSONB`) |
+| (재현성) | 라벨 run + 파라미터 | `labeling_runs`, `labeling_run_params` |
 
 ---
 
