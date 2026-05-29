@@ -1,0 +1,124 @@
+labeling_config:
+  method_version: "regime_label_9axis_v1.1"
+
+  data:
+    exchange: "Binance"
+    market: "USDⓈ-M Futures"
+    symbol: "ETHUSDT"
+    display_pair: "ETH/USDT"
+    start_utc: "2024-01-01 00:00:00"
+    end_utc: "2026-05-25 23:59:59"
+    source_1m: "data/futures/um/monthly/klines/ETHUSDT/1m/"
+    source_5m: "data/futures/um/monthly/klines/ETHUSDT/5m/"
+
+  price_field: "hlc3"
+  price_formula: "(high + low + close) / 3"
+
+  timeframes:
+    - "1m"
+    - "5m"
+
+  direction_method:
+    type: "directional_change_segment"
+    threshold_policy: "abs_log_price_change_quantile_scaled"
+    params:
+      "1m":
+        q_dc: 0.80
+        k_dc_candidates: [3.0, 4.0, 5.0]
+        min_segment_bars_candidates: [5, 10, 15]
+        theta_amp_policy: "same_as_theta_dc"
+        pullback_max_bars_candidates: [10, 20, 30]
+      "5m":
+        q_dc: 0.80
+        k_dc_candidates: [2.0, 3.0, 4.0]
+        min_segment_bars_candidates: [3, 5, 8]
+        theta_amp_policy: "same_as_theta_dc"
+        pullback_max_bars_candidates: [3, 5, 10]
+
+  volatility_method:
+    type: "segment_realized_volatility_per_bar"
+    formula: "sqrt(sum(d_t^2)) / sqrt(N_j)"
+    quantiles:
+      low: 0.33
+      high: 0.66
+
+  auxiliary_metrics:
+    efficiency_ratio:
+      enabled: true
+      formula: "abs(p_end - p_start) / sum(abs(d_t))"
+      not_part_of_final_9_labels: true
+    lag_diagnostics:
+      enabled: true
+      metrics:
+        - "confirm_bar"
+        - "lag_bars"
+        - "lag_move"
+        - "capturable_ratio"
+    tradeability_diagnostics:
+      enabled: true
+      metrics:
+        - "amplitude_to_cost_ratio"
+        - "low_tradeability_segment_flag"
+      not_part_of_final_9_labels: true
+    jump_diagnostics:
+      enabled: true
+      metrics:
+        - "max_jump_share"
+        - "bipower_variation"
+        - "jump_share_bv"
+      not_part_of_final_9_labels: true
+    asymmetric_volatility:
+      enabled: true
+      metrics:
+        - "rv_plus"
+        - "rv_minus"
+        - "downside_vol_share"
+      not_part_of_final_9_labels: true
+
+  final_labels:
+    - "UP_LOW_VOL"
+    - "UP_MID_VOL"
+    - "UP_HIGH_VOL"
+    - "DOWN_LOW_VOL"
+    - "DOWN_MID_VOL"
+    - "DOWN_HIGH_VOL"
+    - "NON_DIRECTIONAL_LOW_VOL"
+    - "NON_DIRECTIONAL_MID_VOL"
+    - "NON_DIRECTIONAL_HIGH_VOL"
+
+  persistence:
+    engine: "postgresql"
+    version: ">=16"
+    database: "regime_benchmark"
+    dsn_env: "REGIME_BENCHMARK_DB_URL"
+    migration_file: "migrations/001_init.sql"
+    write_target: "dedicated_writable_db_only"
+    read_only_mcp_dbs_excluded: true
+    bulk_load: "psycopg3_copy_from_stdin"
+    versioning: "append_only_per_run_id"
+    bar_labels:
+      partition_strategy: "range_monthly"
+      partition_column: "open_time"
+      partition_range:
+        start: "2024-01"
+        end: "2026-06"
+    enums:
+      timeframe:
+        - "1m"
+        - "5m"
+      direction:
+        - "UP"
+        - "DOWN"
+        - "NON_DIRECTIONAL"
+      volatility:
+        - "LOW_VOL"
+        - "MID_VOL"
+        - "HIGH_VOL"
+      final_label_count: 9
+    numeric_type: "double_precision"
+    views:
+      - "bar_labels_1m"
+      - "bar_labels_5m"
+      - "segment_labels_1m"
+      - "segment_labels_5m"
+      - "joined_labels_1m_5m"
