@@ -41,6 +41,45 @@ _TIMEFRAME_SECONDS: dict[str, int] = {"1m": 60, "5m": 300}
 _BINANCE_BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
 
+def _validate_klines(df: pl.DataFrame, timeframe: str, source: object) -> None:
+    """Guard against wrong-schema / wrong-timeframe inputs (review B1).
+
+    Asserts required columns exist, open_time is a UTC Datetime (not raw
+    epoch-ms Int64), and the median bar cadence matches the requested timeframe
+    within ±10%. Raises ValueError on any mismatch — a silent wrong-cadence or
+    wrong-schema file would corrupt all downstream DC/segment computation.
+    """
+    required = {"open_time", "open", "high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{source}: missing required columns {sorted(missing)}")
+    if df.height == 0:
+        raise ValueError(f"{source}: empty kline frame")
+
+    ot_dtype = df.schema["open_time"]
+    if not isinstance(ot_dtype, pl.Datetime):
+        raise ValueError(
+            f"{source}: open_time must be a parsed UTC Datetime, got {ot_dtype!r} "
+            f"(raw epoch-ms Int64 is not allowed here)"
+        )
+
+    if timeframe not in _TIMEFRAME_SECONDS:
+        raise ValueError(f"{source}: unknown timeframe {timeframe!r}")
+    if df.height >= 2:
+        expected = _TIMEFRAME_SECONDS[timeframe]
+        deltas = (
+            df.sort("open_time")
+            .select(pl.col("open_time").diff().dt.total_seconds().alias("d"))
+            .drop_nulls()["d"]
+        )
+        median_cadence = float(deltas.median())  # type: ignore[arg-type]
+        if abs(median_cadence - expected) > 0.10 * expected:
+            raise ValueError(
+                f"{source}: median bar cadence {median_cadence:.0f}s does not match "
+                f"timeframe {timeframe!r} (expected ~{expected}s ±10%)"
+            )
+
+
 def download_monthly_klines(
     symbol: str,
     timeframe: str,
@@ -311,7 +350,21 @@ def load_klines(
     """
     path = Path(source)
     if not path.exists():
-        raise FileNotFoundError(f"Kline CSV not found: {path}")
+        raise FileNotFoundError(f"Kline file not found: {path}")
+
+    # Parquet branch: a .parquet produced by load_period() is ALREADY in the
+    # parsed standard schema (datetime open_time/close_time, float64 prices) —
+    # read it as-is and skip the epoch-ms conversion below.
+    if path.suffix == ".parquet":
+        pdf = pl.read_parquet(path).sort("open_time")
+        n_total = len(pdf)
+        n_unique = pdf.select(pl.col("open_time").n_unique()).item()
+        if n_unique != n_total:
+            raise ValueError(
+                f"Duplicate open_time in {path}: {n_total} rows, {n_unique} unique"
+            )
+        _validate_klines(pdf, timeframe, path)
+        return pdf
 
     df = pl.read_csv(
         path,
@@ -355,6 +408,7 @@ def load_klines(
             f"{n_total} rows, {n_unique} unique timestamps"
         )
 
+    _validate_klines(df, timeframe, path)
     return df
 
 

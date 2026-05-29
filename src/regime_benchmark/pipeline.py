@@ -15,17 +15,22 @@ Executes the 9-label labeling pipeline for both 1m and 5m timeframes:
 
 Loading order: segment_labels -> bar_labels -> labeling_reports.
 Run status is set to 'completed' only after all steps pass.
+
+Frozen calibration (design §8.1):
+  Pass `calibration` to run_pipeline to supply pre-decided per-timeframe
+  FrozenParams (chosen on a calibration split, then locked).  When absent the
+  pipeline falls back to candidate[0] for backward compatibility.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
 
+from regime_benchmark.calibration import FrozenParams
 from regime_benchmark.config import LabelingConfig
 from regime_benchmark.diagnostics.asymmetry import compute_asymmetry_diagnostics_segments
 from regime_benchmark.diagnostics.cost import compute_cost_diagnostics_segments
@@ -50,19 +55,13 @@ from regime_benchmark.volatility.realized import (
     compute_volatility_quantiles,
 )
 
-if TYPE_CHECKING:
-    pass
-
-# Default parameters for M2 synthetic run
-_DEFAULT_K_DC = {"1m": 4.0, "5m": 3.0}
-_DEFAULT_MIN_SEGMENT_BARS = {"1m": 5, "5m": 3}
-_DEFAULT_Q_DC = 0.80
-_DEFAULT_Q_LOW = 0.33
-_DEFAULT_Q_HIGH = 0.66
+# Cost-diagnostic defaults (the only module defaults consumed; k_dc /
+# min_segment_bars / quantiles come from config candidate[0] or FrozenParams).
 _DEFAULT_TAKER_FEE = 0.0004
 _DEFAULT_SLIPPAGE = 0.0002
 
-# 1 month of synthetic data (approx 43200 1m bars, 8640 5m bars)
+# Synthetic data window (M2 thin-run / tests): ~1 month per timeframe.
+_BAR_SECONDS = {"1m": 60, "5m": 300}
 _SYNTHETIC_PERIODS = {"1m": 43200, "5m": 8640}
 _SYNTHETIC_START = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -71,6 +70,9 @@ def run_pipeline(
     config: LabelingConfig,
     source_map: dict[str, str | Path] | None = None,
     synthetic: bool = False,
+    calibration: dict[str, FrozenParams] | None = None,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
 ) -> int:
     """Execute the full 9-label pipeline and return the run_id.
 
@@ -84,6 +86,18 @@ def run_pipeline(
             Ignored when synthetic=True.
         synthetic: If True, generate synthetic OHLCV data instead of loading
             from source_map.  Useful for tests and M2 thin-run.
+        calibration: Optional per-timeframe FrozenParams chosen on a calibration
+            split and locked (design §8.1).  When a timeframe key is present the
+            frozen k_dc / q_dc / min_segment_bars / q_low / q_high override the
+            config candidate[0] defaults.  When absent (None or missing key) the
+            existing candidate[0] fallback is used — backward compatible with all
+            M2/M3 tests.
+        period_start: Actual start of the loaded data slice, recorded in
+            labeling_runs.period_start_utc. Defaults to config.data.start_utc.
+            Pass the real slice bounds (e.g. a 6-month dev window) so the run
+            metadata reflects what was loaded, not the full config span.
+        period_end: Actual end of the loaded data slice. Defaults to
+            config.data.end_utc.
 
     Returns:
         run_id: The labeling_runs.id for this pipeline execution.
@@ -92,20 +106,43 @@ def run_pipeline(
         KeyError: If REGIME_BENCHMARK_DB_URL is not set.
         ValueError: If synthetic=False and source_map is None or missing keys.
     """
+    # SF3: period_start/period_end must be both-or-neither (a partial override
+    # would silently mix the caller's start with config's end → wrong metadata).
+    if (period_start is None) != (period_end is None):
+        raise ValueError("period_start and period_end must both be provided or both be None")
+
+    # SF2: a partial calibration dict would silently mix frozen params for some
+    # timeframes with candidate[0] for others — harmful for reproducibility.
+    if calibration is not None:
+        missing = set(config.timeframes) - set(calibration.keys())
+        if missing:
+            raise ValueError(
+                f"calibration must cover all timeframes {config.timeframes}; "
+                f"missing frozen params for {sorted(missing)}"
+            )
+
     conn = connect()
 
     try:
-        # Determine period bounds
-        period_start = config.data.start_utc
-        period_end = config.data.end_utc
-        if synthetic:
-            # Use synthetic window for M2
-            period_start = _SYNTHETIC_START
-            period_end = datetime(2024, 1, 31, 23, 59, 0, tzinfo=timezone.utc)
+        # Determine period bounds. Explicit period_start/period_end (the ACTUAL
+        # loaded slice) take precedence so labeling_runs records the real data
+        # range, not the full config span (e.g. a 6-month dev slice). Falls back
+        # to config span, or the synthetic window when synthetic=True.
+        run_period_start = period_start if period_start is not None else config.data.start_utc
+        run_period_end = period_end if period_end is not None else config.data.end_utc
+        if synthetic and period_start is None and period_end is None:
+            run_period_start = _SYNTHETIC_START
+            # Derive the actual synthetic end = latest last-bar across timeframes
+            # (avoids the old hard-coded date overstating the loaded span).
+            run_period_end = max(
+                _SYNTHETIC_START
+                + timedelta(seconds=(_SYNTHETIC_PERIODS[tf] - 1) * _BAR_SECONDS[tf])
+                for tf in config.timeframes
+            )
 
-        run_id = register_run(conn, config, period_start, period_end, git_commit=None)
+        run_id = register_run(conn, config, run_period_start, run_period_end, git_commit=None)
 
-        # Process each timeframe independently
+        # Process each timeframe independently (§9.1: never pool across timeframes)
         for tf in config.timeframes:
             _run_timeframe(
                 conn=conn,
@@ -114,6 +151,7 @@ def run_pipeline(
                 config=config,
                 source_map=source_map,
                 synthetic=synthetic,
+                frozen=calibration.get(tf) if calibration is not None else None,
             )
 
         finalize_run(conn, run_id)
@@ -143,8 +181,20 @@ def _run_timeframe(
     config: LabelingConfig,
     source_map: dict[str, str | Path] | None,
     synthetic: bool,
+    frozen: FrozenParams | None = None,
 ) -> None:
-    """Run the full pipeline for one timeframe and load into DB."""
+    """Run the full pipeline for one timeframe and load into DB.
+
+    Args:
+        conn: Open psycopg3 connection (autocommit=False).
+        run_id: labeling_runs.id for this pipeline execution.
+        timeframe: '1m' or '5m'.
+        config: Validated LabelingConfig instance.
+        source_map: Dict mapping timeframe to CSV/parquet path (None if synthetic).
+        synthetic: If True, use make_synthetic_klines instead of source_map.
+        frozen: Pre-decided FrozenParams for this timeframe (design §8.1).
+            When None, falls back to config candidate[0] defaults.
+    """
     # --- Step 1-3: Ingest
     if synthetic:
         klines = make_synthetic_klines(
@@ -169,21 +219,32 @@ def _run_timeframe(
     # mass and bias the quantile downward.
     abs_d_series = pl.Series("abs_d", np.abs(d_arr))
 
-    # --- Step 9: DC threshold
+    # --- Step 9: DC threshold — resolve params from frozen calibration or candidate[0]
     tf_params = config.direction_method.params[timeframe]  # type: ignore[index]
-    k_dc = float(tf_params.k_dc_candidates[0])  # Use first candidate for M2
-    q_dc = float(tf_params.q_dc)
-    theta_dc = compute_theta_dc(abs_d_series, q_dc, k_dc)
+    if frozen is not None:
+        # Frozen calibration path (design §8.1): use pre-decided k/q, override candidate[0]
+        k_dc = float(frozen.k_dc)
+        q_dc = float(frozen.q_dc)
+        min_segment_bars = int(frozen.min_segment_bars)
+        q_low = float(frozen.q_low)
+        q_high = float(frozen.q_high)
+    else:
+        # Backward-compatible candidate[0] fallback
+        k_dc = float(tf_params.k_dc_candidates[0])
+        q_dc = float(tf_params.q_dc)
+        min_segment_bars = int(tf_params.min_segment_bars_candidates[0])
+        q_low = float(config.volatility_method.quantiles.low)
+        q_high = float(config.volatility_method.quantiles.high)
 
-    min_segment_bars = int(tf_params.min_segment_bars_candidates[0])
-    theta_amp = theta_dc  # same_as_theta_dc policy
+    theta_dc = compute_theta_dc(abs_d_series, q_dc, k_dc)
+    theta_amp = theta_dc  # same_as_theta_dc policy (§8.4)
 
     # --- Step 10: Turning points + segments
     turning_points = run_dc_engine(p_arr, theta_dc)
     segments = build_segments(turning_points, p_arr, d_arr)
 
     if len(segments) == 0:
-        # Degenerate case: nothing to label
+        # Degenerate case: nothing to label; still record the used params
         register_params(
             conn,  # type: ignore[arg-type]
             run_id,
@@ -193,8 +254,8 @@ def _run_timeframe(
             q_dc,
             k_dc,
             min_segment_bars,
-            config.volatility_method.quantiles.low,
-            config.volatility_method.quantiles.high,
+            q_low,
+            q_high,
         )
         return
 
@@ -209,8 +270,6 @@ def _run_timeframe(
         for s in segments
         if not s.is_tail_unconfirmed
     ]
-    q_low = config.volatility_method.quantiles.low
-    q_high = config.volatility_method.quantiles.high
     if confirmed_rv:
         q_low_val, q_high_val = compute_volatility_quantiles(confirmed_rv, q_low, q_high)
     else:
@@ -231,7 +290,7 @@ def _run_timeframe(
     # --- Step 17: Bar-level expansion
     bars_df = expand_to_bars(segments, klines)
 
-    # --- Persist
+    # --- Persist: record the actual used values (frozen or candidate[0]) into labeling_run_params
     register_params(
         conn,  # type: ignore[arg-type]
         run_id,
