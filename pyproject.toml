@@ -42,3 +42,6 @@ strict = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "slow: long-running backtests; excluded by the test-gate Stop hook",
+]
