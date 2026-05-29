@@ -35,3 +35,6 @@ Thumbs.db
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+
+# Data (raw Binance zips / parsed parquet — downloaded, not committed)
+data/
